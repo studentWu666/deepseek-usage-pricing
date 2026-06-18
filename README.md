@@ -26,7 +26,7 @@ Tokens  217,813,838  输入 217,798,981 (缓存命中 98.0%) / 输出 845,806
 
 ### 方法一：直接安装（推荐）
 
-👉 待补充（创建仓库后更新链接）
+👉 **[点击安装](https://github.com/studentWu666/deepseek-usage-pricing/raw/main/deepseek-usage-pricing.user.js)**
 
 ### 方法二：手动导入
 
