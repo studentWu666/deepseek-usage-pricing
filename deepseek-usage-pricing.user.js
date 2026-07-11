@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         DeepSeek 用量计费明细
+// @name         DeepSeek 用量计费明细（嵌入式）
 // @namespace    https://platform.deepseek.com/usage
-// @version      4.0
-// @description  在用量卡片上方插入费用和 Token 明细横幅（支持峰谷定价）
+// @version      1.4
+// @description  在用量页面将输入/输出计费嵌入现有卡片中
 // @author       Reasonix
-// @match        https://platform.deepseek.com/usage*
+// @match        https://platform.deepseek.com/usage
 // @icon         https://platform.deepseek.com/favicon.ico
 // @run-at       document-start
 // @grant        none
@@ -13,254 +13,271 @@
 (function () {
     'use strict';
 
-    /* ========================================================
-       定价 (人民币 ¥ / 百万 tokens)
-       峰谷时段：每日北京时间 9:00-12:00, 14:00-18:00 为高峰
-       ======================================================== */
-    const PRICING = {
-        'deepseek-v4-flash': {
-            cacheHit:  { normal: 0.02,  peak: 0.04 },
-            cacheMiss: { normal: 1.00,  peak: 2.00 },
-            output:    { normal: 2.00,  peak: 4.00 },
-        },
-        'deepseek-v4-pro': {
-            cacheHit:  { normal: 0.025, peak: 0.05 },
-            cacheMiss: { normal: 3.00,  peak: 6.00 },
-            output:    { normal: 6.00,  peak: 12.00 },
-        },
-    };
+    /* ==============================
+       0. 拦截器 — 在页面 JS 执行前注入
+       ============================== */
 
-    function getPrice(n) {
-        n = (n || '').toLowerCase();
-        if (PRICING[n]) return PRICING[n];
-        if (/flash|chat|reasoner/.test(n)) return PRICING['deepseek-v4-flash'];
-        if (/pro/.test(n)) return PRICING['deepseek-v4-pro'];
-        return null;
-    }
+    let dsAmount = null;
+    let dsCost = null;
+    let dsToken = null;      // 存 auth token 供兜底重试
+    let dsMonth = 6;
+    let dsYear = 2026;
 
-    // 判断是否高峰时段（北京时间 UTC+8）
-    function isPeak(unixSec) {
-        const h = (new Date(unixSec * 1000).getUTCHours() + 8) % 24;
-        return (h >= 9 && h < 12) || (h >= 14 && h < 18);
-    }
+    // ── 拦截 fetch ──
+    const __origFetch = window.fetch;
+    window.fetch = function (...args) {
+        const req = args[0];
+        const url = (typeof req === 'string' ? req : req?.url) || '';
+        const opts = typeof req === 'object' && !(typeof args[1] === 'object') ? req : args[1];
 
-    function fmt(v) {
-        if (v == null || isNaN(v)) return '¥0.00';
-        return '¥' + (Math.abs(v) < 0.01 ? v.toFixed(4) : v.toFixed(2));
-    }
-    function fmtTk(v) {
-        if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + 'M';
-        if (v >= 1_000) return (v / 1_000).toFixed(1) + 'K';
-        return String(v);
-    }
-
-    /* ========================================================
-       API 拦截
-       ======================================================== */
-    let _amt = null;
-
-    const _f = window.fetch;
-    window.fetch = function (...a) {
-        const u = (typeof a[0] === 'string' ? a[0] : a[0]?.url) || '';
-        const r = _f.apply(this, a);
-        if (u.includes('/api/v0/usage/') && u.includes('/amount')) {
-            return r.then(x => x.clone().json().then(d => { _amt = d; schedule(); return x; }).catch(() => x));
+        // 提取 auth token
+        if (!dsToken) {
+            const auth = opts?.headers?.authorization || opts?.headers?.Authorization;
+            if (auth) dsToken = auth;
         }
-        return r;
+
+        const resp = __origFetch.apply(this, args);
+        if (url.includes('/api/v0/usage/amount')) {
+            return resp.then(r => r.clone().json().then(d => { dsAmount = d; return r; }).catch(() => r));
+        }
+        if (url.includes('/api/v0/usage/cost')) {
+            return resp.then(r => r.clone().json().then(d => { dsCost = d; scheduleEmbed(); return r; }).catch(() => r));
+        }
+        return resp;
     };
 
-    const _xo = XMLHttpRequest.prototype.open;
-    const _xs = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (m, u) {
-        this._u = (typeof u === 'string' ? u : u + '') || '';
-        return _xo.apply(this, arguments);
+    // ── 拦截 XMLHttpRequest ──
+    const __open = XMLHttpRequest.prototype.open;
+    const __send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, url) {
+        this._dsUrl = (typeof url === 'string' ? url : url?.toString()) || '';
+        return __open.apply(this, arguments);
     };
+    XMLHttpRequest.prototype.setRequestHeader = (function (orig) {
+        return function (name, value) {
+            if (!dsToken && /^authorization$/i.test(name)) dsToken = value;
+            return orig.apply(this, arguments);
+        };
+    })(XMLHttpRequest.prototype.setRequestHeader);
+
     XMLHttpRequest.prototype.send = function (...a) {
-        if (this._u.includes('/api/v0/usage/') && this._u.includes('/amount')) {
-            const self = this;
-            self.addEventListener('load', function () {
-                try { _amt = JSON.parse(self.responseText); schedule(); } catch (e) {}
+        if (this._dsUrl.includes('/api/v0/usage/amount')) {
+            this.addEventListener('load', function () {
+                try { dsAmount = JSON.parse(this.responseText); } catch (e) { /* ignore */ }
             });
         }
-        return _xs.apply(this, a);
+        if (this._dsUrl.includes('/api/v0/usage/cost')) {
+            this.addEventListener('load', function () {
+                try { dsCost = JSON.parse(this.responseText); scheduleEmbed(); } catch (e) { /* ignore */ }
+            });
+        }
+        return __send.apply(this, a);
     };
 
-    /* ========================================================
-       解析 — 按 bucket 粒度区分峰谷
-       ======================================================== */
-    function sv(v) {
+    /* ==============================
+       1. 嵌入核心（与拦截器无关）
+       ============================== */
+
+    function safeNum(v) {
         const n = typeof v === 'number' ? v : Number(v);
         return Number.isFinite(n) ? Math.max(n, 0) : 0;
     }
 
-    function parseTokens() {
-        if (!_amt) return null;
-        const body = _amt?.data?.biz_data;
-        if (!body) return null;
-
-        let model = 'deepseek-v4-flash';
-        // 累计峰/谷 token 数
-        let peakHit = 0, peakMiss = 0, peakOut = 0;
-        let normHit = 0, normMiss = 0, normOut = 0;
-
-        if (body.series) {
-            for (const s of body.series) {
-                model = s.model || model;
-                for (const b of (s.buckets || [])) {
-                    const peak = isPeak(b.time);
-                    const u = b.usage || {};
-                    if (peak) {
-                        peakHit  += sv(u.PROMPT_CACHE_HIT_TOKEN);
-                        peakMiss += sv(u.PROMPT_CACHE_MISS_TOKEN);
-                        peakOut  += sv(u.RESPONSE_TOKEN);
-                    } else {
-                        normHit  += sv(u.PROMPT_CACHE_HIT_TOKEN);
-                        normMiss += sv(u.PROMPT_CACHE_MISS_TOKEN);
-                        normOut  += sv(u.RESPONSE_TOKEN);
-                    }
-                }
-            }
-        } else if (Array.isArray(body) && body[0]?.total) {
-            for (const m of body[0].total) {
-                if (m.usage?.some(u => sv(u.amount) > 0)) model = m.model || model;
-                // 旧格式无时间戳，全部按 normal 计
-                for (const u of (m.usage || [])) {
-                    const v = sv(u.amount) * 1_000_000;
-                    if (u.type === 'PROMPT_CACHE_HIT_TOKEN')  normHit  += v;
-                    if (u.type === 'PROMPT_CACHE_MISS_TOKEN') normMiss += v;
-                    if (u.type === 'RESPONSE_TOKEN')          normOut  += v;
-                }
-            }
-        }
-
-        const totalHit = peakHit + normHit;
-        const totalMiss = peakMiss + normMiss;
-        const totalOut = peakOut + normOut;
-        if (totalHit + totalMiss + totalOut === 0) return null;
-
-        return {
-            model,
-            peak:  { cacheHit: peakHit,  cacheMiss: peakMiss, output: peakOut },
-            norm:  { cacheHit: normHit,  cacheMiss: normMiss, output: normOut },
-            total: { cacheHit: totalHit, cacheMiss: totalMiss, output: totalOut },
-        };
-    }
-
-    /* ========================================================
-       注入
-       ======================================================== */
-    let injected = false;
-
-    function inject() {
-        if (injected) return;
-
-        const t = parseTokens();
-        if (!t) return;
-
-        const price = getPrice(t.model);
-        if (!price) return;
-
-        // 峰谷费用计算
-        const peakFee = (t.peak.cacheHit / 1e6) * price.cacheHit.peak
-                      + (t.peak.cacheMiss / 1e6) * price.cacheMiss.peak
-                      + (t.peak.output / 1e6) * price.output.peak;
-        const normFee = (t.norm.cacheHit / 1e6) * price.cacheHit.normal
-                      + (t.norm.cacheMiss / 1e6) * price.cacheMiss.normal
-                      + (t.norm.output / 1e6) * price.output.normal;
-        const totalFee = peakFee + normFee;
-
-        // 分项费用（用 normal 价格算基准，峰谷分开显示）
-        const chFee = (t.norm.cacheHit / 1e6) * price.cacheHit.normal
-                    + (t.peak.cacheHit / 1e6) * price.cacheHit.peak;
-        const cmFee = (t.norm.cacheMiss / 1e6) * price.cacheMiss.normal
-                    + (t.peak.cacheMiss / 1e6) * price.cacheMiss.peak;
-        const oFee  = (t.norm.output / 1e6) * price.output.normal
-                    + (t.peak.output / 1e6) * price.output.peak;
-
-        const totalInput = t.total.cacheHit + t.total.cacheMiss;
-        const cacheRate = totalInput > 0 ? ((t.total.cacheHit / totalInput) * 100).toFixed(1) : '0';
-
-        // 找 grid
-        let grid = null;
+    function findTextEl(text) {
+        // 优先找无子元素的纯文本节点
         const all = document.querySelectorAll('*');
         for (const el of all) {
-            const ch = el.children;
-            if (ch.length >= 3) {
-                let hasC = false, hasT = false;
-                for (const c of ch) {
-                    const txt = c.textContent?.trim() || '';
-                    if (txt.startsWith('消费金额')) hasC = true;
-                    if (txt.startsWith('Tokens') && !txt.includes('100,000')) hasT = true;
-                }
-                if (hasC && hasT) { grid = el; break; }
+            if (el.tagName === 'TH') continue;
+            if (el.textContent?.trim() === text && !el.querySelector('*')) return el;
+        }
+        // 放宽
+        for (const el of all) {
+            if (el.tagName === 'TH') continue;
+            if (el.textContent?.trim() === text && el.children.length <= 1) return el;
+        }
+        return null;
+    }
+
+    function doEmbed() {
+        const amtBody = dsAmount?.data?.biz_data;
+        const costArr = dsCost?.data?.biz_data?.[0];     // usage/cost 返回数组
+        if (!amtBody || !costArr) return false;
+
+        const amtTotal = amtBody.total || [];
+        const costTotal = costArr.total || [];
+
+        const mTotal = amtTotal.find(m =>
+            (m.usage || []).reduce((s, x) => s + safeNum(x.amount), 0) > 0
+        );
+        if (!mTotal) return false;
+        const cTotal = costTotal.find(m => m.model === mTotal.model);
+        if (!cTotal) return false;
+
+        const usage = {};
+        for (const u of mTotal.usage) usage[u.type] = safeNum(u.amount);
+        const costMap = {};
+        for (const u of cTotal.usage) costMap[u.type] = safeNum(u.amount);
+
+        const cacheHit = usage['PROMPT_CACHE_HIT_TOKEN'] || 0;
+        const cacheMiss = usage['PROMPT_CACHE_MISS_TOKEN'] || 0;
+        const outputT = usage['RESPONSE_TOKEN'] || 0;
+        const totalInput = cacheHit + cacheMiss;
+
+        const inputCost = (costMap['PROMPT_CACHE_HIT_TOKEN'] || 0) + (costMap['PROMPT_CACHE_MISS_TOKEN'] || 0);
+        const outputCost = costMap['RESPONSE_TOKEN'] || 0;
+
+        const cacheRate = totalInput > 0
+            ? ((cacheHit / totalInput) * 100).toFixed(1) + '%'
+            : '-';
+
+        let ok = false;
+
+        // ── 六月消费卡片（同行内联） ──
+        const costLabel = findTextEl('六月消费（按 UTC+0 时间）');
+        if (costLabel && !document.querySelector('.ds-cost-breakdown')) {
+            const amtRow = costLabel.parentElement?.querySelector('._7ed1d04');
+            if (amtRow) {
+                const s = document.createElement('span');
+                s.className = 'ds-cost-breakdown';
+                s.textContent = `输入 ¥${inputCost.toFixed(2)} / 输出 ¥${outputCost.toFixed(2)}`;
+                // 插在最后一个 span（金额数字）后面
+                const lastSpan = amtRow.querySelector('span:last-child');
+                if (lastSpan) lastSpan.after(s);
+                else amtRow.appendChild(s);
+                ok = true;
             }
         }
 
-        if (!grid) return;
-        if (document.querySelector('#ds-pricing-banner')) { injected = true; return; }
+        // ── Tokens 区域（同行内联） ──
+        const tLabel = findTextEl('Tokens');
+        if (tLabel && !document.querySelector('.ds-token-breakdown')) {
+            const flexRow = tLabel.closest('[style*="baseline"]') || tLabel.parentElement;
+            if (flexRow) {
+                const s = document.createElement('span');
+                s.className = 'ds-token-breakdown';
+                s.textContent = `输入 ${totalInput.toLocaleString()} (缓存命中 ${cacheRate}) / 输出 ${outputT.toLocaleString()}`;
+                // 插在最后一个 span（数字）后面
+                const lastSpan = flexRow.querySelector('span:last-child');
+                if (lastSpan) lastSpan.after(s);
+                else flexRow.appendChild(s);
+                ok = true;
+            }
+        }
 
-        const brand = 'var(--dsw-alias-brand-primary, #3964fe)';
-        const primary = 'var(--dsw-alias-label-primary, #000)';
-
-        const banner = document.createElement('div');
-        banner.id = 'ds-pricing-banner';
-        banner.style.cssText = `display:flex;gap:24px;flex-wrap:wrap;margin-bottom:16px;padding:16px 20px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,0.04));font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary,#6a7a9a);`;
-
-        // 峰谷标签
-        const peakTag = peakFee > 0
-            ? `<span style="display:inline-block;font-size:10px;padding:1px 6px;border-radius:4px;background:#fff3e0;color:#e65100;margin-left:4px;">峰</span>`
-            : '';
-
-        banner.innerHTML = `
-            <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;flex:1;min-width:240px;">
-                <span style="font-weight:600;color:${brand};white-space:nowrap;font-size:14px;">💰 费用明细</span>
-                <span><span style="color:#22c55e;">缓存命中</span> <b style="color:${primary};">${fmt(chFee)}</b></span>
-                <span><span style="color:#f59e0b;">未命中</span> <b style="color:${primary};">${fmt(cmFee)}</b></span>
-                <span><span style="color:#3b82f6;">输出</span> <b style="color:${primary};">${fmt(oFee)}</b></span>
-                <span style="border-left:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,0.1));padding-left:12px;">
-                    <b style="color:${primary};">合计 ${fmt(totalFee)}</b>${peakTag}
-                </span>
-                ${peakFee > 0 ? `<span style="font-size:11px;color:#e65100;">(高峰 ${fmt(peakFee)} / 平时 ${fmt(normFee)})</span>` : ''}
-            </div>
-            <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;flex:1;min-width:240px;border-left:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,0.08));padding-left:20px;">
-                <span style="font-weight:600;color:${brand};white-space:nowrap;font-size:14px;">📊 Token 明细</span>
-                <span>输入 <b style="color:${primary};">${fmtTk(totalInput)}</b> (命中 ${fmtTk(t.total.cacheHit)} / 未命中 ${fmtTk(t.total.cacheMiss)})</span>
-                <span>输出 <b style="color:${primary};">${fmtTk(t.total.output)}</b></span>
-                <span>缓存率 <b style="color:${brand};">${cacheRate}%</b></span>
-            </div>
-        `;
-
-        grid.parentElement?.insertBefore(banner, grid);
-        injected = true;
-        console.log('[DS] ✅', fmt(totalFee), `(${peakFee > 0 ? '峰' + fmt(peakFee) + '+' : ''}谷${fmt(normFee)})`, '输入', fmtTk(totalInput), cacheRate + '%');
+        // 清理旧版大面板
+        document.querySelector('#ds-pricing-breakdown')?.remove();
+        return ok;
     }
 
-    /* ========================================================
-       调度
-       ======================================================== */
-    let timer = null;
-    let count = 0;
+    /* ==============================
+       2. 调度策略
+       ============================== */
 
-    function schedule() {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-            inject();
-            if (!injected && count++ < 120) schedule();
-        }, 500);
+    let retries = 0;
+    const MAX_RETRIES = 30;  // 15 秒
+
+    function scheduleEmbed() {
+        if (retries >= MAX_RETRIES) return;
+        if (doEmbed()) {
+            console.log('[DS Pricing] ✅ 已嵌入');
+            retries = 0;
+            return;
+        }
+        retries++;
+        setTimeout(scheduleEmbed, 500);
     }
 
-    function boot() {
-        const obs = new MutationObserver(() => { if (!injected) inject(); });
+    // ── 兜底：通过 MutationObserver 监听目标元素出现后重试 ──
+    function watchForTargets() {
+        const seen = new Set();
+        const obs = new MutationObserver(() => {
+            for (const text of ['六月消费（按 UTC+0 时间）', 'Tokens']) {
+                if (seen.has(text)) continue;
+                if (findTextEl(text)) {
+                    seen.add(text);
+                    // 目标元素已出现，触发嵌入
+                    scheduleEmbed();
+                }
+            }
+        });
         obs.observe(document.body, { childList: true, subtree: true });
-        setTimeout(() => obs.disconnect(), 60000);
-        schedule();
+        // 自动断开，不无限监听
+        setTimeout(() => obs.disconnect(), 20000);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', boot);
+    // ── 兜底：直接调用 API（仅当存了 token 且拦截器没抓到数据时） ──
+    async function fallbackFetch() {
+        if (dsAmount && dsCost) return;
+        if (!dsToken) {
+            // 还没拿到 token，等一会再试
+            setTimeout(fallbackFetch, 1500);
+            return;
+        }
+        try {
+            const headers = { authorization: dsToken, 'x-client-platform': 'web', 'x-app-version': '1.0.0' };
+            if (!dsAmount) {
+                const r = await fetch(`/api/v0/usage/amount?month=${dsMonth}&year=${dsYear}`, { headers, credentials: 'same-origin' });
+                if (r.ok) dsAmount = await r.json();
+            }
+            if (!dsCost) {
+                const r = await fetch(`/api/v0/usage/cost?month=${dsMonth}&year=${dsYear}`, { headers, credentials: 'same-origin' });
+                if (r.ok) dsCost = await r.json();
+            }
+            if (dsAmount && dsCost) scheduleEmbed();
+        } catch (e) {
+            console.warn('[DS Pricing] fallback 请求失败:', e);
+        }
+    }
+
+    /* ==============================
+       3. 启动
+       ============================== */
+
+    // 页面加载完成后执行
+    if (document.readyState === 'complete') {
+        init();
     } else {
-        boot();
+        window.addEventListener('load', init);
     }
 
-    console.log('[DS Pricing] v4.0 (峰谷定价)');
+    function init() {
+        // 注入全局样式
+        const style = document.createElement('style');
+        style.textContent = `
+            .ds-cost-breakdown,.ds-token-breakdown{
+                font-size:11px!important;color:#6a7a9a!important;
+                font-weight:400!important;margin-left:8px!important;
+            }
+        `;
+        document.head.appendChild(style);
+
+        // 启动 MutationObserver 监视 DOM
+        watchForTargets();
+
+        // 数据已就绪则直接嵌入
+        if (dsAmount && dsCost) {
+            scheduleEmbed();
+        }
+
+        // 兜底：3 秒后如果还没嵌入，尝试主动拉 API
+        setTimeout(() => {
+            if (!document.querySelector('.ds-cost-breakdown') && !document.querySelector('.ds-token-breakdown')) {
+                fallbackFetch();
+            }
+        }, 3000);
+    }
+
+    // SPA 路由变化重置
+    const __pushState = history.pushState;
+    history.pushState = function () {
+        __pushState.apply(this, arguments);
+        retries = 0;
+        dsAmount = null;
+        dsCost = null;
+        setTimeout(() => {
+            watchForTargets();
+            scheduleEmbed();
+            setTimeout(fallbackFetch, 2000);
+        }, 500);
+    };
 })();
