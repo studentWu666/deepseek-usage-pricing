@@ -1,64 +1,61 @@
 # DeepSeek 用量计费明细
 
-在 DeepSeek 开放平台用量页面自动显示费用和 Token 明细的 Tampermonkey 用户脚本。
+在 DeepSeek 开放平台用量页面嵌入输入/输出计费明细的 Tampermonkey / ScriptCat 用户脚本。
 
 ## 效果
 
-在 [platform.deepseek.com/usage](https://platform.deepseek.com/usage) 页面的用量卡片上方自动插入横幅：
+在 [platform.deepseek.com/usage](https://platform.deepseek.com/usage) 页面上，将输入/输出 token 和费用明细直接嵌入到现有卡片中：
 
+**六月消费卡片**
 ```
-💰 费用明细   缓存命中 ¥7.18   未命中 ¥12.27   输出 ¥2.38   合计 ¥21.83 峰   (高峰 ¥5.39 / 平时 ¥16.44)  |  📊 Token 明细   输入 369.47M (命中 363.04M / 未命中 6.43M)   输出 1.10M   缓存率 98.2%
+¥10.25 输入 ¥8.59 / 输出 ¥1.69  CNY
 ```
 
-横幅使用 DeepSeek 原生 CSS 变量，自动适配 light / dark 主题。
+**Tokens 行**
+```
+Tokens  217,813,838  输入 217,798,981 (缓存命中 98.0%) / 输出 845,806
+```
+
+无需额外面板，不占空间，完全融入页面原有布局。
 
 ## 安装
 
-1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
-2. 👉 **[点击安装脚本](https://github.com/studentWu666/deepseek-usage-pricing/raw/main/deepseek-usage-pricing.user.js)**
-3. 打开 [用量页面](https://platform.deepseek.com/usage) 即可看到横幅
+### 前置条件
+
+安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [ScriptCat](https://scriptcat.org/) 浏览器扩展。
+
+### 方法一：直接安装（推荐）
+
+👉 **[点击安装](https://github.com/studentWu666/deepseek-usage-pricing/raw/main/deepseek-usage-pricing.user.js)**
+
+### 方法二：手动导入
+
+1. 下载 `deepseek-usage-pricing.user.js`
+2. 打开 Tampermonkey → 管理面板 → 实用工具 → 导入
+3. 选择下载的文件并安装
 
 ## 功能
 
-- 📊 **费用拆分**：缓存命中 / 未命中 / 输出三档费用 + 合计
-- ⏰ **峰谷定价**：根据北京时间自动识别高峰时段，分段计算费用
-- 🔤 **Token 明细**：输入(命中/未命中) + 输出 + 缓存率
-- 🎨 **主题适配**：使用 `--dsw-alias-*` CSS 变量，自动跟随 light/dark
-- 🔄 **三重保障**：fetch 拦截 + XHR 拦截 + MutationObserver
-- 📱 **响应式**：flex-wrap 适配窄屏
-
-## 定价
-
-### deepseek-v4-flash
-
-| 计费项 | 平时价格 (¥/M) | 高峰价格 (¥/M) |
-|--------|---------------|---------------|
-| 输入（缓存命中）| 0.02 | 0.04 |
-| 输入（缓存未命中）| 1.00 | 2.00 |
-| 输出 | 2.00 | 4.00 |
-
-### deepseek-v4-pro
-
-| 计费项 | 平时价格 (¥/M) | 高峰价格 (¥/M) |
-|--------|---------------|---------------|
-| 输入（缓存命中）| 0.025 | 0.05 |
-| 输入（缓存未命中）| 3.00 | 6.00 |
-| 输出 | 6.00 | 12.00 |
-
-**高峰时段**：每日北京时间 9:00~12:00 和 14:00~18:00
+- 📊 **费用拆分**：显示输入（缓存命中 + 未命中）和输出的费用明细
+- 🔤 **Token 拆分**：显示输入/输出 token 数及缓存命中率
+- 🔄 **自动加载**：拦截 API + 主动拉取 + DOM 监听三重保障，刷新即时显示
+- 🧩 **嵌入式**：直接嵌在页面现有卡片中，不额外占用空间
 
 ## 数据来源
 
-拦截页面后台 API 响应，支持两种格式：
-- 新版 `by_api_key/amount` — series[].buckets[].usage（按小时粒度区分峰谷）
-- 旧版 `amount?month=` — total[].usage[].amount（按平时价格计算）
+脚本从 DeepSeek 用量页面后台 API 获取数据：
+- `/api/v0/usage/amount` — Token 用量
+- `/api/v0/usage/cost` — 费用明细
 
-数据仅在浏览器本地处理，不上传任何第三方。
+数据仅在你浏览器本地处理，不上传任何第三方。
 
 ## 兼容性
 
-- ✅ Tampermonkey (Chrome / Edge / Firefox)
+- ✅ Tampermonkey
 - ✅ ScriptCat
+- ✅ Microsoft Edge
+- ✅ Google Chrome
+- ✅ Firefox (需 Tampermonkey)
 
 ## 许可证
 
